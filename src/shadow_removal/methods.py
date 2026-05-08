@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import cv2
+import numpy as np
+
+from .masks import feather_alpha
+
+
+EPS = 1e-6
+
+
+def _safe_regions(rgb: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    shadow = rgb[mask].astype(np.float32)
+    lit = rgb[~mask].astype(np.float32)
+    if len(shadow) == 0:
+        shadow = rgb.reshape(-1, 3).astype(np.float32)
+    if len(lit) < 16:
+        lit = rgb.reshape(-1, 3).astype(np.float32)
+    return shadow, lit
+
+
+def _blend(original: np.ndarray, corrected: np.ndarray, mask: np.ndarray, feather: int = 15) -> np.ndarray:
+    alpha = feather_alpha(mask, feather)[:, :, None]
+    return np.clip(original.astype(np.float32) * (1 - alpha) + corrected.astype(np.float32) * alpha, 0, 255)
+
+
+def rgb_ratio(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    shadow, lit = _safe_regions(rgb, mask)
+    gain = np.median(lit, axis=0) / np.maximum(np.median(shadow, axis=0), EPS)
+    gain = np.clip(gain, 0.75, 3.0)
+    corrected = rgb.astype(np.float32) * gain[None, None, :]
+    return _blend(rgb, corrected, mask)
+
+
+def lab_l_ratio(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    shadow, lit = _safe_regions(lab, mask)
+    gain_l = np.median(lit[:, 0]) / max(float(np.median(shadow[:, 0])), EPS)
+    gain_l = float(np.clip(gain_l, 0.8, 2.6))
+    chroma_shift = np.median(lit[:, 1:3], axis=0) - np.median(shadow[:, 1:3], axis=0)
+    chroma_shift = np.clip(chroma_shift, -12, 12)
+    corrected = lab.copy()
+    corrected[:, :, 0] *= gain_l
+    corrected[:, :, 1:3] += chroma_shift[None, None, :]
+    corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+    corrected_rgb = cv2.cvtColor(corrected, cv2.COLOR_LAB2RGB)
+    return _blend(rgb, corrected_rgb, mask)
+
+
+def hsv_value(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    shadow, lit = _safe_regions(hsv, mask)
+    gain_v = np.median(lit[:, 2]) / max(float(np.median(shadow[:, 2])), EPS)
+    gain_v = float(np.clip(gain_v, 0.8, 2.8))
+    sat_gain = np.median(lit[:, 1] + EPS) / np.median(shadow[:, 1] + EPS)
+    sat_gain = float(np.clip(sat_gain, 0.75, 1.25))
+    corrected = hsv.copy()
+    corrected[:, :, 2] *= gain_v
+    corrected[:, :, 1] *= sat_gain
+    corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+    corrected_rgb = cv2.cvtColor(corrected, cv2.COLOR_HSV2RGB)
+    return _blend(rgb, corrected_rgb, mask)
+
+
+def ycrcb_luma(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb).astype(np.float32)
+    shadow, lit = _safe_regions(ycrcb, mask)
+    gain_y = np.median(lit[:, 0]) / max(float(np.median(shadow[:, 0])), EPS)
+    gain_y = float(np.clip(gain_y, 0.8, 2.8))
+    corrected = ycrcb.copy()
+    corrected[:, :, 0] *= gain_y
+    corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+    corrected_rgb = cv2.cvtColor(corrected, cv2.COLOR_YCrCb2RGB)
+    return _blend(rgb, corrected_rgb, mask)
+
+
+def mean_std_transfer(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    shadow, lit = _safe_regions(rgb, mask)
+    s_mean = shadow.mean(axis=0)
+    s_std = np.maximum(shadow.std(axis=0), 1.0)
+    l_mean = lit.mean(axis=0)
+    l_std = np.maximum(lit.std(axis=0), 1.0)
+    corrected = (rgb.astype(np.float32) - s_mean[None, None, :]) * (l_std / s_std)[None, None, :]
+    corrected += l_mean[None, None, :]
+    return _blend(rgb, corrected, mask)
+
+
+def linear_regression(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    shadow, lit = _safe_regions(rgb, mask)
+    s_mean = shadow.mean(axis=0)
+    l_mean = lit.mean(axis=0)
+    s_var = np.maximum(shadow.var(axis=0), 1.0)
+    scale = np.clip(lit.var(axis=0) / s_var, 0.25, 4.0) ** 0.5
+    bias = l_mean - scale * s_mean
+    corrected = rgb.astype(np.float32) * scale[None, None, :] + bias[None, None, :]
+    return _blend(rgb, corrected, mask)
+
+
+def _boundary_light_ratio(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    shadow_edge = mask & (cv2.dilate((~mask).astype(np.uint8), kernel) > 0)
+    lit_edge = (~mask) & (cv2.dilate(mask.astype(np.uint8), kernel) > 0)
+    shadow_pixels = rgb[shadow_edge].astype(np.float32)
+    lit_pixels = rgb[lit_edge].astype(np.float32)
+
+    if len(shadow_pixels) < 32 or len(lit_pixels) < 32:
+        shadow_pixels, lit_pixels = _safe_regions(rgb, mask)
+
+    shadow_med = np.maximum(np.median(shadow_pixels, axis=0), 1.0)
+    lit_med = np.maximum(np.median(lit_pixels, axis=0), 1.0)
+    fallback = np.clip(lit_med / shadow_med - 1.0, 0.05, 2.5)
+
+    ratios = []
+    for channel in range(3):
+        s = shadow_pixels[:, channel]
+        l = lit_pixels[:, channel]
+        n = int(min(len(s), len(l), 4000))
+        if n < 32:
+            ratios.append(fallback[channel])
+            continue
+
+        s_idx = np.linspace(0, len(s) - 1, n).astype(np.int32)
+        l_idx = np.linspace(0, len(l) - 1, n).astype(np.int32)
+        votes = l[l_idx] / np.maximum(s[s_idx], 1.0) - 1.0
+        votes = votes[np.isfinite(votes)]
+        votes = votes[(votes > 0.0) & (votes < 3.0)]
+        if len(votes) < 16:
+            ratios.append(fallback[channel])
+            continue
+
+        hist, edges = np.histogram(votes, bins=np.arange(0.0, 3.05, 0.05))
+        mode_idx = int(np.argmax(hist))
+        mode = 0.5 * (edges[mode_idx] + edges[mode_idx + 1])
+        robust = 0.5 * mode + 0.5 * float(np.median(votes))
+        ratios.append(np.clip(robust, 0.05, 2.5))
+
+    return np.array(ratios, dtype=np.float32)
+
+
+def guo_lighting_model(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Paper-inspired Guo/Dai/Hoiem direct-light relighting model."""
+    r = _boundary_light_ratio(rgb, mask)
+    k = 1.0 - feather_alpha(mask, radius=30)
+    factor = (r[None, None, :] + 1.0) / (k[:, :, None] * r[None, None, :] + 1.0)
+    corrected = rgb.astype(np.float32) * factor
+
+    lab_original = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_corrected = cv2.cvtColor(np.clip(corrected, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_original[:, :, 0] = lab_corrected[:, :, 0]
+    conservative = cv2.cvtColor(np.clip(lab_original, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+    # Apply the color model inside deep shadow, but keep penumbrae mostly luminance-based.
+    alpha = feather_alpha(mask, radius=20)[:, :, None]
+    chroma_alpha = np.clip(alpha - 0.35, 0.0, 1.0) / 0.65
+    mixed = conservative.astype(np.float32) * (1.0 - chroma_alpha) + corrected.astype(np.float32) * chroma_alpha
+    return np.clip(mixed * alpha + rgb.astype(np.float32) * (1.0 - alpha), 0, 255)
+
+
+def retinex_shadow_edges(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Mask-guided Retinex-style illumination normalization."""
+    image = rgb.astype(np.float32) + 1.0
+    log_image = np.log(image)
+    corrected_log = log_image.copy()
+    alpha = feather_alpha(mask, radius=25)
+
+    for sigma, weight in ((15, 0.50), (80, 0.35), (250, 0.15)):
+        illum = cv2.GaussianBlur(log_image, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        lit_illum = illum[~mask]
+        if len(lit_illum) == 0:
+            target = np.median(illum.reshape(-1, 3), axis=0)
+        else:
+            target = np.median(lit_illum, axis=0)
+        correction = target[None, None, :] - illum
+        corrected_log += weight * alpha[:, :, None] * correction
+
+    corrected = np.exp(corrected_log) - 1.0
+    lab_original = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_corrected = cv2.cvtColor(np.clip(corrected, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_original[:, :, 0] = lab_corrected[:, :, 0]
+    l_only = cv2.cvtColor(np.clip(lab_original, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return _blend(rgb, l_only, mask, feather=25)
+
+
+def anchor_optimization(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Non-shadow anchor relighting with per-channel grid-search gains."""
+    image = rgb.astype(np.float32)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    shadow, lit = _safe_regions(image, mask)
+    shadow_l = l[mask]
+    lit_l = l[~mask]
+    if len(shadow_l) == 0 or len(lit_l) == 0:
+        return rgb.copy()
+
+    anchor_l = float(np.percentile(lit_l, 55))
+    current_l = float(np.percentile(shadow_l, 55))
+    base_l_gain = np.clip(anchor_l / max(current_l, 1.0), 0.8, 2.8)
+
+    target_color = np.percentile(lit, 55, axis=0)
+    shadow_color = np.percentile(shadow, 55, axis=0)
+    base_gain = np.clip(target_color / np.maximum(shadow_color, 1.0), 0.75, 3.0)
+
+    candidates = []
+    for scale in np.linspace(0.75, 1.35, 13):
+        gain = np.clip(base_gain * scale, 0.75, 3.2)
+        trial_shadow = np.clip(shadow * gain[None, :], 0, 255)
+        trial_lab = cv2.cvtColor(trial_shadow.reshape(1, -1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+        l_error = abs(float(np.percentile(trial_lab[:, 0], 55)) - anchor_l)
+        color_error = float(np.linalg.norm(np.median(trial_shadow, axis=0) - target_color))
+        overexposure = float(np.mean(trial_shadow > 250.0)) * 40.0
+        candidates.append((l_error + 0.08 * color_error + overexposure, gain))
+
+    gain = min(candidates, key=lambda item: item[0])[1]
+    l_gain = float(np.clip(base_l_gain, 0.9, 2.4))
+    rgb_corrected = image * gain[None, None, :]
+
+    lab_corrected = lab.copy()
+    lab_corrected[:, :, 0] *= l_gain
+    l_corrected = cv2.cvtColor(np.clip(lab_corrected, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+
+    alpha = feather_alpha(mask, radius=20)[:, :, None]
+    corrected = 0.55 * rgb_corrected + 0.45 * l_corrected
+    return np.clip(image * (1.0 - alpha) + corrected * alpha, 0, 255)
+
+
+def local_patch_match(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Patch-wise relighting using local non-shadow anchors around each shadow component."""
+    image = rgb.astype(np.float32)
+    corrected = image.copy()
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+
+    for label in range(1, num_labels):
+        component = labels == label
+        if stats[label, cv2.CC_STAT_AREA] < 64:
+            continue
+        ring = (cv2.dilate(component.astype(np.uint8), kernel) > 0) & (~mask)
+        if ring.sum() < 64:
+            ring = ~mask
+        component_pixels = image[component]
+        ring_pixels = image[ring]
+        if len(component_pixels) == 0 or len(ring_pixels) == 0:
+            continue
+        comp_med = np.maximum(np.median(component_pixels, axis=0), 1.0)
+        ring_med = np.maximum(np.median(ring_pixels, axis=0), 1.0)
+        gain = np.clip(ring_med / comp_med, 0.75, 3.0)
+        corrected[component] = image[component] * gain[None, :]
+
+    return _blend(rgb, corrected, mask, feather=18)
+
+
+def hybrid_best(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    shadow, lit = _safe_regions(lab, mask)
+    gain_l = np.percentile(lit[:, 0], 60) / max(float(np.percentile(shadow[:, 0], 60)), EPS)
+    gain_l = float(np.clip(gain_l, 0.9, 2.2))
+    chroma_shift = 0.35 * (np.median(lit[:, 1:3], axis=0) - np.median(shadow[:, 1:3], axis=0))
+    chroma_shift = np.clip(chroma_shift, -8, 8)
+    corrected = lab.copy()
+    corrected[:, :, 0] = corrected[:, :, 0] * gain_l
+    corrected[:, :, 1:3] = corrected[:, :, 1:3] + chroma_shift[None, None, :]
+    corrected_rgb = cv2.cvtColor(np.clip(corrected, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return _blend(rgb, corrected_rgb, mask, feather=25)
+
+
+METHODS: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
+    "rgb_ratio": rgb_ratio,
+    "lab_l_ratio": lab_l_ratio,
+    "hsv_value": hsv_value,
+    "ycrcb_luma": ycrcb_luma,
+    "mean_std_transfer": mean_std_transfer,
+    "linear_regression": linear_regression,
+    "guo_lighting_model": guo_lighting_model,
+    "retinex_shadow_edges": retinex_shadow_edges,
+    "anchor_optimization": anchor_optimization,
+    "local_patch_match": local_patch_match,
+    "hybrid_best": hybrid_best,
+}
