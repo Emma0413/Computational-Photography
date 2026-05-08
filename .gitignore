@@ -2,6 +2,6 @@ __pycache__/
 *.py[cod]
 .venv/
 data/
-outputs/
 ISTD_Dataset/
 *.zip
+outputs/**/images/
