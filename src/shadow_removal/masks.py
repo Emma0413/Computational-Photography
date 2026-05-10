@@ -24,6 +24,28 @@ def auto_shadow_mask(rgb: np.ndarray) -> np.ndarray:
     return refine_mask(mask > 0)
 
 
+def istd_calibrated_shadow_mask(rgb: np.ndarray) -> np.ndarray:
+    """Estimate a region-level shadow mask calibrated on the local ISTD subset."""
+    score = _shadow_likelihood(rgb).astype(np.float32)
+    smooth = cv2.GaussianBlur(score, (0, 0), sigmaX=5, sigmaY=5, borderType=cv2.BORDER_REFLECT)
+    mask = smooth >= float(np.percentile(smooth, 75))
+    return _region_cleanup(mask, open_size=5, close_size=41, min_area_frac=0.002)
+
+
+def _region_cleanup(mask: np.ndarray, open_size: int, close_size: int, min_area_frac: float) -> np.ndarray:
+    cleaned = refine_mask(mask, open_size=open_size, close_size=close_size)
+    h, w = cleaned.shape
+    min_area = max(64, int(min_area_frac * h * w))
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned.astype(np.uint8), connectivity=8)
+
+    region_mask = np.zeros_like(cleaned, dtype=bool)
+    for label in range(1, labels_count):
+        if stats[label, cv2.CC_STAT_AREA] >= min_area:
+            region_mask |= labels == label
+
+    return refine_mask(region_mask, open_size=3, close_size=close_size)
+
+
 def guo_region_shadow_mask(rgb: np.ndarray) -> np.ndarray:
     """Estimate a mask with a Guo-style paired shadow/non-shadow region test.
 
@@ -99,6 +121,7 @@ def guo_region_shadow_mask(rgb: np.ndarray) -> np.ndarray:
 MASK_GENERATORS = {
     "basic": auto_shadow_mask,
     "guo": guo_region_shadow_mask,
+    "istd": istd_calibrated_shadow_mask,
 }
 
 

@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-dir", required=True, help="Directory of shadow-free reference images.")
     parser.add_argument("--mask-dir", help="Optional directory of binary shadow masks.")
     parser.add_argument("--auto-mask", choices=list(MASK_GENERATORS), default="basic", help="Automatic mask generator to use when --mask-dir is omitted.")
+    parser.add_argument("--mask-source", choices=["provided", "auto"], default="provided", help="Use provided masks when available, or force automatic mask generation.")
     parser.add_argument("--invert-mask", action="store_true", help="Invert mask polarity after loading.")
     parser.add_argument("--out", required=True, help="Output directory.")
     parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS))
@@ -52,6 +53,29 @@ def write_csv(path: Path, rows: list[dict[str, str | float]]) -> None:
         writer.writerows(rows)
 
 
+def mask_metrics(pred: np.ndarray, gt: np.ndarray) -> dict[str, float]:
+    shadow = gt
+    non_shadow = ~gt
+    tp = float(np.logical_and(pred, shadow).sum())
+    fp = float(np.logical_and(pred, non_shadow).sum())
+    fn = float(np.logical_and(~pred, shadow).sum())
+    tn = float(np.logical_and(~pred, non_shadow).sum())
+    shadow_total = max(tp + fn, 1.0)
+    non_shadow_total = max(tn + fp, 1.0)
+    union = max(tp + fp + fn, 1.0)
+    shadow_error = fn / shadow_total
+    non_shadow_error = fp / non_shadow_total
+    return {
+        "iou": tp / union,
+        "precision": tp / max(tp + fp, 1.0),
+        "recall": tp / shadow_total,
+        "specificity": tn / non_shadow_total,
+        "ber": 0.5 * (shadow_error + non_shadow_error),
+        "pred_area": float(pred.mean()),
+        "gt_area": float(gt.mean()),
+    }
+
+
 def main() -> None:
     args = parse_args()
     out = ensure_dir(args.out)
@@ -60,6 +84,7 @@ def main() -> None:
     mask_out = ensure_dir(out / "masks")
 
     rows: list[dict[str, str | float]] = []
+    mask_rows: list[dict[str, str | float]] = []
     for shadow_path in list_images(args.shadow_dir):
         gt_path = matching_path(args.gt_dir, shadow_path)
         if gt_path is None:
@@ -72,11 +97,21 @@ def main() -> None:
             raise ValueError(f"Shape mismatch for {shadow_path.name}: input {rgb.shape}, gt {gt.shape}")
 
         mask_path = matching_path(args.mask_dir, shadow_path) if args.mask_dir else None
-        mask = read_mask(mask_path, rgb.shape[:2]) if mask_path else MASK_GENERATORS[args.auto_mask](rgb)
+        gt_mask = read_mask(mask_path, rgb.shape[:2]) if mask_path else None
+        if gt_mask is not None and args.mask_source == "provided":
+            mask = gt_mask
+        else:
+            mask = MASK_GENERATORS[args.auto_mask](rgb)
         if args.invert_mask:
             mask = ~mask
+            if gt_mask is not None:
+                gt_mask = ~gt_mask
         mask = refine_mask(mask)
         write_rgb(mask_out / shadow_path.name, mask_to_rgb(mask))
+        if gt_mask is not None and args.mask_source == "auto":
+            mask_row: dict[str, str | float] = {"image": shadow_path.name, "method": args.auto_mask}
+            mask_row.update(mask_metrics(mask, refine_mask(gt_mask)))
+            mask_rows.append(mask_row)
 
         sheet_items = [("input", rgb), ("mask", mask_to_rgb(mask)), ("ground_truth", gt)]
         for method_name in args.methods:
@@ -92,6 +127,9 @@ def main() -> None:
     write_csv(out / "metrics.csv", rows)
     if rows:
         write_csv(out / "summary.csv", summarize(rows))
+    write_csv(out / "mask_metrics.csv", mask_rows)
+    if mask_rows:
+        write_csv(out / "mask_summary.csv", summarize(mask_rows))
 
 
 if __name__ == "__main__":

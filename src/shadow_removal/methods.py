@@ -139,6 +139,131 @@ def _boundary_light_ratio(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.array(ratios, dtype=np.float32)
 
 
+def _global_light_ratio(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    shadow, lit = _safe_regions(rgb, mask)
+
+    # Stronger reference than median-vs-60th percentile.
+    shadow_ref = np.maximum(np.percentile(shadow, 35, axis=0), 1.0)
+    lit_ref = np.maximum(np.percentile(lit, 70, axis=0), 1.0)
+
+    return np.clip(lit_ref / shadow_ref - 1.0, 0.05, 2.8).astype(np.float32)
+
+
+def _patch_features(rgb_patch: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Return LAB chroma mean, luminance mean, and texture strength."""
+    lab = cv2.cvtColor(
+        np.clip(rgb_patch, 0, 255).astype(np.uint8),
+        cv2.COLOR_RGB2LAB
+    ).astype(np.float32)
+
+    l_mean = float(np.mean(lab[:, :, 0]))
+    ab_mean = np.mean(lab[:, :, 1:3], axis=(0, 1))
+
+    gray = lab[:, :, 0]
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    texture = float(np.mean(np.sqrt(gx * gx + gy * gy)))
+
+    return ab_mean, l_mean, texture
+
+
+def _boundary_light_ratio_with_k(rgb: np.ndarray, mask: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """Estimate Guo-style direct/environment ratio from boundary patch pairs."""
+    fallback = _boundary_light_ratio(rgb, mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    shadow_edge = mask & (cv2.dilate((~mask).astype(np.uint8), kernel) > 0)
+    coords = np.column_stack(np.nonzero(shadow_edge))
+    if len(coords) < 16:
+        return fallback
+
+    max_samples = 3000
+    if len(coords) > max_samples:
+        sample_idx = np.linspace(0, len(coords) - 1, max_samples).astype(np.int32)
+        coords = coords[sample_idx]
+
+    image = rgb.astype(np.float32)
+    h, w = mask.shape
+    radius = 6
+    offset = 10
+    votes = []
+    dist_inside = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    dist_outside = cv2.distanceTransform((~mask).astype(np.uint8), cv2.DIST_L2, 5)
+    signed = dist_inside - dist_outside
+    grad_y = cv2.Sobel(signed, cv2.CV_32F, 0, 1, ksize=3)
+    grad_x = cv2.Sobel(signed, cv2.CV_32F, 1, 0, ksize=3)
+
+    for y, x in coords:
+        normal = np.array([grad_y[y, x], grad_x[y, x]], dtype=np.float32)
+        norm = float(np.linalg.norm(normal))
+        if norm < EPS:
+            continue
+        normal /= norm
+
+        shadow_center = np.rint(np.array([y, x], dtype=np.float32) + offset * normal).astype(np.int32)
+        lit_center = np.rint(np.array([y, x], dtype=np.float32) - offset * normal).astype(np.int32)
+
+        sy, sx = int(shadow_center[0]), int(shadow_center[1])
+        ly, lx = int(lit_center[0]), int(lit_center[1])
+        if sy - radius < 0 or sy + radius + 1 > h or sx - radius < 0 or sx + radius + 1 > w:
+            continue
+        if ly - radius < 0 or ly + radius + 1 > h or lx - radius < 0 or lx + radius + 1 > w:
+            continue
+
+        shadow_mask_patch = mask[sy - radius:sy + radius + 1, sx - radius:sx + radius + 1]
+        lit_mask_patch = mask[ly - radius:ly + radius + 1, lx - radius:lx + radius + 1]
+        if shadow_mask_patch.mean() < 0.65 or lit_mask_patch.mean() > 0.35:
+            continue
+
+        shadow_rgb_patch = image[sy - radius:sy + radius + 1, sx - radius:sx + radius + 1]
+        lit_rgb_patch = image[ly - radius:ly + radius + 1, lx - radius:lx + radius + 1]
+        shadow_k_patch = k[sy - radius:sy + radius + 1, sx - radius:sx + radius + 1]
+        lit_k_patch = k[ly - radius:ly + radius + 1, lx - radius:lx + radius + 1]
+
+        shadow_ab, shadow_l, shadow_tex = _patch_features(shadow_rgb_patch)
+        lit_ab, lit_l, lit_tex = _patch_features(lit_rgb_patch)
+
+        chroma_dist = float(np.linalg.norm(shadow_ab - lit_ab))
+        if chroma_dist > 14.0:
+            continue
+
+        tex_ratio = (lit_tex + 1.0) / (shadow_tex + 1.0)
+        if tex_ratio < 0.45 or tex_ratio > 2.2:
+            continue
+
+        if lit_l <= shadow_l + 3.0:
+            continue
+
+        brightness_ratio = lit_l / max(shadow_l, 1.0)
+        if brightness_ratio > 2.6:
+            continue
+
+        shadow_rgb = np.maximum(shadow_rgb_patch.mean(axis=(0, 1)), 1.0)
+        lit_rgb = np.maximum(lit_rgb_patch.mean(axis=(0, 1)), 1.0)
+        shadow_k = float(shadow_k_patch.mean())
+        lit_k = float(lit_k_patch.mean())
+        if lit_k - shadow_k < 0.20:
+            continue
+
+        denom = shadow_rgb * lit_k - lit_rgb * shadow_k
+        if np.any(np.abs(denom) < EPS):
+            continue
+        vote = (lit_rgb - shadow_rgb) / denom
+        if np.all(np.isfinite(vote)) and np.all(vote > 0.0) and np.all(vote < 3.5):
+            votes.append(vote)
+
+    if len(votes) < 16:
+        return fallback
+
+    votes_arr = np.array(votes, dtype=np.float32)
+    bins = np.floor(votes_arr / 0.1).astype(np.int32)
+    unique_bins, counts = np.unique(bins, axis=0, return_counts=True)
+    best_bin = unique_bins[int(np.argmax(counts))]
+    in_bin = np.all(bins == best_bin[None, :], axis=1)
+    if in_bin.sum() < 8:
+        return np.clip(np.median(votes_arr, axis=0), 0.05, 2.5).astype(np.float32)
+
+    return np.clip(np.median(votes_arr[in_bin], axis=0), 0.05, 2.5).astype(np.float32)
+
 def _guided_filter_gray(guide: np.ndarray, src: np.ndarray, radius: int = 18, eps: float = 1e-3) -> np.ndarray:
     guide = guide.astype(np.float32)
     src = src.astype(np.float32)
@@ -181,25 +306,26 @@ def guo_lighting_model(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     alpha = feather_alpha(mask, radius=20)[:, :, None]
     chroma_alpha = np.clip(alpha - 0.35, 0.0, 1.0) / 0.65
     mixed = conservative.astype(np.float32) * (1.0 - chroma_alpha) + corrected.astype(np.float32) * chroma_alpha
-    return np.clip(mixed * alpha + rgb.astype(np.float32) * (1.0 - alpha), 0, 255)
+    return np.clip(mixed, 0, 255).astype(np.uint8)
 
 
 def guo_soft_matting(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Guo-style lighting model with an image-aware guided soft matte."""
-    r = _boundary_light_ratio(rgb, mask)
     alpha = _image_aware_soft_matte(rgb, mask, radius=18)
+
+    # Keep strong shadow, but avoid making every masked pixel full shadow.
+    alpha = np.where(mask, np.maximum(alpha, 0.78), alpha).astype(np.float32)
+
+    # Guo k: 1 = non-shadow, 0 = full shadow
     k = 1.0 - alpha
+
+    patch_r = _boundary_light_ratio_with_k(rgb, mask, k)
+    r = np.clip(patch_r, 0.05, 1.5).astype(np.float32)
+
     factor = (r[None, None, :] + 1.0) / (k[:, :, None] * r[None, None, :] + 1.0)
     corrected = rgb.astype(np.float32) * factor
 
-    lab_original = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lab_corrected = cv2.cvtColor(np.clip(corrected, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-    lab_original[:, :, 0] = lab_corrected[:, :, 0]
-    luminance_only = cv2.cvtColor(np.clip(lab_original, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
-
-    color_weight = np.clip((alpha - 0.45) / 0.55, 0.0, 1.0)[:, :, None]
-    relit = luminance_only * (1.0 - color_weight) + corrected * color_weight
-    return np.clip(rgb.astype(np.float32) * (1.0 - alpha[:, :, None]) + relit * alpha[:, :, None], 0, 255)
+    return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
 def retinex_shadow_edges(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -309,6 +435,31 @@ def hybrid_best(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return _blend(rgb, corrected_rgb, mask, feather=25)
 
 
+def material_local_hybrid(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Masked hybrid of material-patch Guo relighting and local patch correction."""
+    image = rgb.astype(np.float32)
+    guo = guo_soft_matting(rgb, mask).astype(np.float32)
+    local = local_patch_match(rgb, mask).astype(np.float32)
+
+    mixed = 0.35 * guo + 0.65 * local
+
+    lab_original = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_mixed = cv2.cvtColor(np.clip(mixed, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    shadow_l = lab_original[:, :, 0][mask]
+    lit_l = lab_original[:, :, 0][~mask]
+    if len(shadow_l) and len(lit_l):
+        target_l = float(np.percentile(lit_l, 50))
+        max_lift = np.clip(target_l - float(np.percentile(shadow_l, 50)), 12.0, 85.0)
+        lab_mixed[:, :, 0] = np.minimum(lab_mixed[:, :, 0], lab_original[:, :, 0] + max_lift)
+        mixed = cv2.cvtColor(np.clip(lab_mixed, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+
+    alpha = feather_alpha(mask, radius=10)
+    alpha[~mask] = 0.0
+    alpha[mask] = np.maximum(alpha[mask], 0.75)
+    result = image * (1.0 - alpha[:, :, None]) + mixed * alpha[:, :, None]
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 METHODS: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
     "rgb_ratio": rgb_ratio,
     "lab_l_ratio": lab_l_ratio,
@@ -322,4 +473,5 @@ METHODS: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
     "anchor_optimization": anchor_optimization,
     "local_patch_match": local_patch_match,
     "hybrid_best": hybrid_best,
+    "material_local_hybrid": material_local_hybrid,
 }
