@@ -139,6 +139,32 @@ def _boundary_light_ratio(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.array(ratios, dtype=np.float32)
 
 
+def _guided_filter_gray(guide: np.ndarray, src: np.ndarray, radius: int = 18, eps: float = 1e-3) -> np.ndarray:
+    guide = guide.astype(np.float32)
+    src = src.astype(np.float32)
+    ksize = (2 * radius + 1, 2 * radius + 1)
+    mean_i = cv2.boxFilter(guide, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REFLECT)
+    mean_p = cv2.boxFilter(src, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REFLECT)
+    corr_i = cv2.boxFilter(guide * guide, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REFLECT)
+    corr_ip = cv2.boxFilter(guide * src, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REFLECT)
+    var_i = corr_i - mean_i * mean_i
+    cov_ip = corr_ip - mean_i * mean_p
+    a = cov_ip / (var_i + eps)
+    b = mean_p - a * mean_i
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REFLECT)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REFLECT)
+    return np.clip(mean_a * guide + mean_b, 0.0, 1.0)
+
+
+def _image_aware_soft_matte(rgb: np.ndarray, mask: np.ndarray, radius: int = 18) -> np.ndarray:
+    initial = feather_alpha(mask, radius=22)
+    guide = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    matte = _guided_filter_gray(guide, initial, radius=radius, eps=2e-3)
+    matte[mask & (initial > 0.92)] = np.maximum(matte[mask & (initial > 0.92)], 0.92)
+    matte[(~mask) & (initial < 0.08)] = np.minimum(matte[(~mask) & (initial < 0.08)], 0.08)
+    return np.clip(matte, 0.0, 1.0).astype(np.float32)
+
+
 def guo_lighting_model(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Paper-inspired Guo/Dai/Hoiem direct-light relighting model."""
     r = _boundary_light_ratio(rgb, mask)
@@ -156,6 +182,24 @@ def guo_lighting_model(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     chroma_alpha = np.clip(alpha - 0.35, 0.0, 1.0) / 0.65
     mixed = conservative.astype(np.float32) * (1.0 - chroma_alpha) + corrected.astype(np.float32) * chroma_alpha
     return np.clip(mixed * alpha + rgb.astype(np.float32) * (1.0 - alpha), 0, 255)
+
+
+def guo_soft_matting(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Guo-style lighting model with an image-aware guided soft matte."""
+    r = _boundary_light_ratio(rgb, mask)
+    alpha = _image_aware_soft_matte(rgb, mask, radius=18)
+    k = 1.0 - alpha
+    factor = (r[None, None, :] + 1.0) / (k[:, :, None] * r[None, None, :] + 1.0)
+    corrected = rgb.astype(np.float32) * factor
+
+    lab_original = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_corrected = cv2.cvtColor(np.clip(corrected, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_original[:, :, 0] = lab_corrected[:, :, 0]
+    luminance_only = cv2.cvtColor(np.clip(lab_original, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+
+    color_weight = np.clip((alpha - 0.45) / 0.55, 0.0, 1.0)[:, :, None]
+    relit = luminance_only * (1.0 - color_weight) + corrected * color_weight
+    return np.clip(rgb.astype(np.float32) * (1.0 - alpha[:, :, None]) + relit * alpha[:, :, None], 0, 255)
 
 
 def retinex_shadow_edges(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -273,6 +317,7 @@ METHODS: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
     "mean_std_transfer": mean_std_transfer,
     "linear_regression": linear_regression,
     "guo_lighting_model": guo_lighting_model,
+    "guo_soft_matting": guo_soft_matting,
     "retinex_shadow_edges": retinex_shadow_edges,
     "anchor_optimization": anchor_optimization,
     "local_patch_match": local_patch_match,

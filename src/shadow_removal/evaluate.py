@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from .io import ensure_dir, list_images, matching_path, read_mask, read_rgb, write_rgb
-from .masks import auto_shadow_mask, refine_mask
+from .masks import MASK_GENERATORS, refine_mask
 from .methods import METHODS
 from .metrics import compute_metrics
 from .visualize import contact_sheet, mask_to_rgb
@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shadow-dir", required=True, help="Directory of shadow images.")
     parser.add_argument("--gt-dir", required=True, help="Directory of shadow-free reference images.")
     parser.add_argument("--mask-dir", help="Optional directory of binary shadow masks.")
+    parser.add_argument("--auto-mask", choices=list(MASK_GENERATORS), default="basic", help="Automatic mask generator to use when --mask-dir is omitted.")
     parser.add_argument("--invert-mask", action="store_true", help="Invert mask polarity after loading.")
     parser.add_argument("--out", required=True, help="Output directory.")
     parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS))
@@ -56,6 +57,7 @@ def main() -> None:
     out = ensure_dir(args.out)
     image_out = ensure_dir(out / "images")
     sheet_out = ensure_dir(out / "contact_sheets")
+    mask_out = ensure_dir(out / "masks")
 
     rows: list[dict[str, str | float]] = []
     for shadow_path in list_images(args.shadow_dir):
@@ -70,10 +72,11 @@ def main() -> None:
             raise ValueError(f"Shape mismatch for {shadow_path.name}: input {rgb.shape}, gt {gt.shape}")
 
         mask_path = matching_path(args.mask_dir, shadow_path) if args.mask_dir else None
-        mask = read_mask(mask_path, rgb.shape[:2]) if mask_path else auto_shadow_mask(rgb)
+        mask = read_mask(mask_path, rgb.shape[:2]) if mask_path else MASK_GENERATORS[args.auto_mask](rgb)
         if args.invert_mask:
             mask = ~mask
         mask = refine_mask(mask)
+        write_rgb(mask_out / shadow_path.name, mask_to_rgb(mask))
 
         sheet_items = [("input", rgb), ("mask", mask_to_rgb(mask)), ("ground_truth", gt)]
         for method_name in args.methods:

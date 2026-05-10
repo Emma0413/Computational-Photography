@@ -4,8 +4,7 @@ import cv2
 import numpy as np
 
 
-def auto_shadow_mask(rgb: np.ndarray) -> np.ndarray:
-    """Estimate a shadow mask from low luminance and saturation/color cues."""
+def _shadow_likelihood(rgb: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     l = lab[:, :, 0].astype(np.float32)
@@ -15,10 +14,92 @@ def auto_shadow_mask(rgb: np.ndarray) -> np.ndarray:
     darkness = 255.0 - l
     saturation_penalty = cv2.normalize(s, None, 0, 80, cv2.NORM_MINMAX)
     value_darkness = 255.0 - v
-    score = np.clip(0.60 * darkness + 0.30 * value_darkness - 0.10 * saturation_penalty, 0, 255)
-    score_u8 = score.astype(np.uint8)
+    return np.clip(0.60 * darkness + 0.30 * value_darkness - 0.10 * saturation_penalty, 0, 255)
+
+
+def auto_shadow_mask(rgb: np.ndarray) -> np.ndarray:
+    """Estimate a shadow mask from low luminance and saturation/color cues."""
+    score_u8 = _shadow_likelihood(rgb).astype(np.uint8)
     _, mask = cv2.threshold(score_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return refine_mask(mask > 0)
+
+
+def guo_region_shadow_mask(rgb: np.ndarray) -> np.ndarray:
+    """Estimate a mask with a Guo-style paired shadow/non-shadow region test.
+
+    This is a lightweight approximation of Guo, Dai, and Hoiem's detection idea:
+    propose dark connected regions, compare each region with a neighboring lit
+    ring, and keep regions that are darker while retaining compatible texture and
+    chromaticity.
+    """
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    texture = np.abs(cv2.Laplacian(gray, cv2.CV_32F))
+    score = _shadow_likelihood(rgb).astype(np.uint8)
+    threshold, _ = cv2.threshold(score, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    high_score = float(np.percentile(score, 80))
+    candidates = score >= max(float(threshold), high_score)
+    candidates = refine_mask(candidates, open_size=3, close_size=7)
+
+    h, w = candidates.shape
+    min_area = max(48, int(0.0004 * h * w))
+    max_area = int(0.70 * h * w)
+    keep = np.zeros_like(candidates, dtype=bool)
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(candidates.astype(np.uint8), connectivity=8)
+
+    for label in range(1, labels_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area or area > max_area:
+            continue
+
+        region = labels == label
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        radius = max(11, min(41, int(0.25 * max(width, height))))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+        outer = cv2.dilate(region.astype(np.uint8), kernel) > 0
+        ring = outer & ~region
+
+        if ring.sum() < max(32, area // 12):
+            x0 = max(0, x - radius)
+            y0 = max(0, y - radius)
+            x1 = min(w, x + width + radius)
+            y1 = min(h, y + height + radius)
+            ring = np.zeros_like(region)
+            ring[y0:y1, x0:x1] = True
+            ring &= ~region
+
+        if ring.sum() < 32:
+            continue
+
+        shadow_lab = lab[region]
+        lit_lab = lab[ring]
+        shadow_l = float(np.median(shadow_lab[:, 0]))
+        lit_l = float(np.median(lit_lab[:, 0]))
+        if lit_l - shadow_l < 7.0:
+            continue
+
+        chroma_gap = float(np.linalg.norm(np.median(shadow_lab[:, 1:3], axis=0) - np.median(lit_lab[:, 1:3], axis=0)))
+        l_ratio = lit_l / max(shadow_l, 1.0)
+        shadow_texture = float(np.median(texture[region]))
+        lit_texture = float(np.median(texture[ring]))
+        texture_gap = abs(shadow_texture - lit_texture) / max(shadow_texture + lit_texture, 1.0)
+
+        if l_ratio > 1.08 and chroma_gap < 22.0 and texture_gap < 0.65:
+            keep |= region
+
+    if keep.sum() < min_area:
+        keep = score >= float(np.percentile(score, 85))
+
+    return refine_mask(keep, open_size=3, close_size=11)
+
+
+MASK_GENERATORS = {
+    "basic": auto_shadow_mask,
+    "guo": guo_region_shadow_mask,
+}
 
 
 def refine_mask(mask: np.ndarray, open_size: int = 3, close_size: int = 9) -> np.ndarray:
