@@ -1,18 +1,6 @@
 # Traditional Single-Image Shadow Removal
 
-This repository implements and evaluates traditional, non-learning shadow removal methods for paired single-image shadow removal. The project was built for a computational photography final project focused on comparing classical color-space, relighting, Retinex, and local-region methods.
-
-The main goal is not to beat modern deep learning methods. Instead, the project studies how far traditional methods can go, where they fail, and whether more structured illumination models improve over simple global color correction.
-
-## Features
-
-- 11 traditional shadow removal methods.
-- Paired-image evaluation on ISTD-style datasets.
-- Optional automatic mask estimation when masks are unavailable.
-- Metrics over full image, shadow region, non-shadow region, and shadow boundary.
-- RGB and LAB RMSE reporting for comparison with shadow-removal literature.
-- Contact-sheet visualizations for qualitative comparison.
-- Dataset subset selection for large datasets.
+This project implements and evaluates traditional, non-learning shadow removal methods. It focuses on paired single-image shadow removal using color-space correction, statistical relighting, Retinex-style illumination normalization, and Guo-style boundary/material-patch relighting.
 
 ## Setup
 
@@ -36,11 +24,11 @@ data/selected/
     img_001.png
 ```
 
-The filenames must match across the three folders. Masks should be white for shadow pixels and black for non-shadow pixels. If your dataset uses the opposite convention, pass `--invert-mask`.
+Filenames must match across the three folders. Masks should be white for shadow pixels and black for non-shadow pixels. If a dataset uses the opposite convention, pass `--invert-mask`.
 
-## ISTD Subset Selection
+## Select An ISTD Subset
 
-For a full ISTD-style dataset:
+For an ISTD-style dataset organized as:
 
 ```text
 ISTD_Dataset/
@@ -50,7 +38,7 @@ ISTD_Dataset/
     train_C/   # shadow-free ground truth
 ```
 
-Select a smaller diverse subset:
+select a smaller subset with:
 
 ```bash
 python -m src.shadow_removal.select_subset \
@@ -63,18 +51,9 @@ python -m src.shadow_removal.select_subset \
   --max-per-scene 2
 ```
 
-The selector writes:
-
-```text
-data/selected/shadow/
-data/selected/shadow_free/
-data/selected/mask/
-data/selected/categories.csv
-```
-
 ## Run Evaluation
 
-Evaluate all implemented methods:
+Evaluate all implemented methods on a paired dataset:
 
 ```bash
 python -m src.shadow_removal.evaluate \
@@ -84,16 +63,33 @@ python -m src.shadow_removal.evaluate \
   --out outputs/selected_eval
 ```
 
-Outputs:
+The evaluator writes:
 
 ```text
-outputs/selected_eval/metrics.csv          # per-image, per-method metrics
-outputs/selected_eval/summary.csv          # mean/std summary by method
-outputs/selected_eval/images/              # restored images
-outputs/selected_eval/contact_sheets/      # visual comparison grids
+outputs/selected_eval/metrics.csv
+outputs/selected_eval/summary.csv
+outputs/selected_eval/contact_sheets/
 ```
 
+If masks are unavailable, omit `--mask-dir` and choose an automatic detector:
+
+```bash
+python -m src.shadow_removal.evaluate \
+  --shadow-dir data/selected/shadow \
+  --gt-dir data/selected/shadow_free \
+  --auto-mask basic \
+  --out outputs/selected_eval_auto
+```
+
+Available automatic masks:
+
+- `basic`: LAB/HSV darkness cue.
+- `guo`: Guo-inspired region test.
+- `istd`: detector calibrated for the local selected ISTD subset.
+
 ## Run One Image
+
+With a provided mask:
 
 ```bash
 python -m src.shadow_removal.run_single \
@@ -103,80 +99,44 @@ python -m src.shadow_removal.run_single \
   --out outputs/single
 ```
 
-## Implemented Methods
+With an automatic mask:
 
-Simple baselines:
+```bash
+python -m src.shadow_removal.run_single \
+  --image data/Self/example.jpg \
+  --auto-mask basic \
+  --mask-source auto \
+  --out outputs/single_self
+```
 
-1. `rgb_ratio`: per-channel RGB gain from lit/shadow statistics.
-2. `lab_l_ratio`: LAB luminance correction with chroma offset.
-3. `hsv_value`: HSV value-channel relighting.
-4. `ycrcb_luma`: YCrCb luma-channel relighting.
-5. `mean_std_transfer`: mean/std color transfer from shadow to lit regions.
-6. `linear_regression`: affine per-channel color correction.
+## Methods
 
-More structured traditional methods:
+Simple color-space baselines:
 
-7. `guo_lighting_model`: Guo/Dai/Hoiem-inspired boundary lighting-ratio model.
-8. `retinex_shadow_edges`: mask-guided Retinex-style illumination normalization.
-9. `anchor_optimization`: non-shadow anchor-based correction.
-10. `local_patch_match`: local paired-region correction from nearby non-shadow pixels.
+1. `rgb_ratio`
+2. `lab_l_ratio`
+3. `hsv_value`
+4. `ycrcb_luma`
 
-Study-driven hybrid:
+Statistical and local correction methods:
 
-11. `hybrid_best`: LAB luminance correction with conservative chroma transfer and feathered blending.
+5. `mean_std_transfer`
+6. `linear_regression`
+7. `anchor_optimization`
+8. `local_patch_match`
+9. `hybrid_best`
+10. `material_local_hybrid`
 
-The paper-inspired methods are approximations implemented in a unified OpenCV pipeline, not exact reproductions of the original authors' code.
+Paper-inspired illumination methods:
+
+11. `guo_lighting_model`
+12. `guo_soft_matting`
+13. `retinex_shadow_edges`
+
+`guo_soft_matting` is a Guo-inspired approximation. It uses guided-filter soft matting and material-patch lighting-ratio voting, not the original paper's full closed-form matting and graph pipeline.
+
+`material_local_hybrid` is the final hybrid method. It combines Guo-style material-patch relighting with local masked correction while keeping non-shadow pixels unchanged outside the mask.
 
 ## Metrics
 
-The evaluator reports:
-
-- RGB MAE/RMSE.
-- LAB MAE/RMSE.
-- PSNR and SSIM.
-- Shadow-region error.
-- Non-shadow-region error.
-- Boundary-ring error.
-
-LAB RMSE is the primary metric for literature comparison. RGB metrics and contact sheets are used for visual interpretation.
-
-## Current Results
-
-The latest checked run is:
-
-```text
-data/selected_diverse/
-outputs/selected_diverse_eval_complex/
-```
-
-Summary:
-
-| Metric | Best Method | Value |
-| --- | --- | ---: |
-| LAB RMSE all | `local_patch_match` | 15.16 |
-| LAB RMSE shadow | `hsv_value` | 17.48 |
-| LAB boundary RMSE | `local_patch_match` | 14.82 |
-| RGB RMSE all | `guo_lighting_model` | 25.14 |
-| SSIM | `guo_lighting_model` | 0.907 |
-
-These results show that local/boundary-aware traditional methods outperform simple global color-space corrections on the selected ISTD subset.
-
-## Project Documents
-
-- [PROJECT_STEPS.md](PROJECT_STEPS.md): experiment plan and final report checklist.
-- [REPORT_OUTLINE.md](REPORT_OUTLINE.md): suggested final report structure.
-- [RESULTS_SUMMARY.md](RESULTS_SUMMARY.md): current result summary.
-- [REFERENCES.md](REFERENCES.md): citation-ready references and method mapping.
-
-## Notes For Git
-
-Large datasets and generated outputs are ignored by `.gitignore`:
-
-```text
-ISTD_Dataset/
-data/
-outputs/
-*.zip
-```
-
-Commit the source code, requirements, and project documentation, but do not commit the full ISTD dataset or generated output images.
+The evaluation reports RGB and LAB MAE/RMSE, PSNR, SSIM, shadow-region error, non-shadow-region error, and boundary-ring error. Quantitative metrics are computed against paired shadow-free ground truth images.
