@@ -140,3 +140,6 @@ Paper-inspired illumination methods:
 ## Metrics
 
 The evaluation reports RGB and LAB MAE/RMSE, PSNR, SSIM, shadow-region error, non-shadow-region error, and boundary-ring error. Quantitative metrics are computed against paired shadow-free ground truth images.
+
+##Results
+See Drive link: https://drive.google.com/drive/folders/1kq8qq50tzCwGtLQAblMJS2iow3kyaslH?usp=drive_link
